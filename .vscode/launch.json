@@ -1,0 +1,17 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  // , "1 day","--duration", "10 Y"
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Run",
+      "type": "python",
+      "request": "launch",
+      "program": "download_bars.py",
+      "console": "integratedTerminal",
+      "args": ["--size", "1 day", "--start-date", "20110808", "--end-date", "20210808", "ABNB"]
+    }
+  ]
+}
