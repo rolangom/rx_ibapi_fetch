@@ -240,7 +240,6 @@ def run_v1():
                 rx_op.merge(max_concurrent=2),
                 rx_op.flat_map(handle_ib_resp('ib_bardata_1day', conn)),
                 # rx_op.combine_latest(conn),
-
             ) \
             .subscribe(
                 on_next=on_final_results, #lambda s: print(s),
@@ -251,26 +250,80 @@ def run_v1():
     init_daily_reqs()
     client.run()
 
+
+def init_daily_reqs(client: AlphaClientWrapper, conn: psycopg2._psycopg.connection, symbols: List[str]):
+    connection = client.connected
+    def run_flow(_: Any):
+        def build_ibreq(symbol: str):
+            return lambda _: make_ib_contract_req_plain(client, symbol, endDateTime="", durationStr="10 Y", barSizeSetting="1 day")\
+                .pipe(rx_op.catch(rx.empty()))
+        obs_list = [
+            rx.defer(build_ibreq(symbol))
+            for symbol in symbols
+        ]
+        return rx.from_iterable(obs_list).pipe(
+            rx_op.merge(max_concurrent=10),
+            rx_op.flat_map(handle_ib_resp('ib_bardata_1day', conn)),
+        )
+    return connection.pipe(
+        rx_op.flat_map(handle_conn_status),
+        rx_op.flat_map(run_flow),
+    )
+
 def get_all_1daybar_bd_symbols(conn: psycopg2._psycopg.connection) -> List[str]:
     sql = "SELECT DISTINCT symbol FROM ib_bardata_1day"
     df = pd.read_sql(sql, conn)
     return df['symbol'].tolist()
 
-def get_symbol_all_days(conn: psycopg2._psycopg.connection, symbol: str) -> List[dt.date]:
-    sql = "SELECT DISTINCT date FROM ib_bardata_1day WHERE symbol = %s order by 1"
+def get_symbol_all_days(conn: psycopg2._psycopg.connection, symbol: str) -> Tuple[str, List[dt.date]]:
+    sql = """SELECT DISTINCT date FROM ib_bardata_1day a
+ WHERE symbol = %s
+   and date >= (select max(distinct date_trunc('day',date)) from ib_bardata_1hour x where x.symbol = a.symbol)
+ order by 1"""
     df = pd.read_sql(sql, conn, params=(symbol,))
-    return df['date'].tolist()
+    return symbol, df['date'].tolist()
 
-def fetch_symbol_1hourbar(client: AlphaClientWrapper):
+def fetch_symbol_1hourbar(client: AlphaClientWrapper) -> Callable[[str, dt.datetime], rx.Observable]:
     def handle_symbol(symbol: str, date: dt.datetime) -> rx.Observable:
         date_str = date.strftime("%Y%m%d 23:59:59")
-        return make_ib_contract_req_plain(client, symbol, endDateTime=date_str, durationStr="1 D", barSizeSetting="1 hour")
+        return make_ib_contract_req_plain(client, symbol, endDateTime=date_str, durationStr="1 D", barSizeSetting="1 hour")\
+            .pipe(rx_op.catch(rx.empty()))
     return handle_symbol
+
+def handle_symbol_dates(handler: Callable[[str, dt.datetime], rx.Observable], symbol: str, dates: List[dt.datetime]) -> rx.Observable:
+    def build_req(symbol: str, date: dt.datetime):
+        return lambda _: handler(symbol, date)
+    obs = [rx.defer(build_req(symbol, date)) for date in dates]
+    return rx.from_iterable(obs).pipe(rx_op.merge(max_concurrent=5))
+
+
+def run_1hour_process(client: AlphaClientWrapper, conn: psycopg2._psycopg.connection):
+    connection = client.connected
+    symbols = get_all_1daybar_bd_symbols(conn)
+    handle_symbol = fetch_symbol_1hourbar(client)
+
+    def run_flow(_: Any):
+        def build_symbols_date_req(symbol: str):
+            return lambda _: rx.of(get_symbol_all_days(conn, symbol))\
+                .pipe(
+                    rx_op.flat_map(lambda tupl: handle_symbol_dates(handle_symbol, tupl[0], tupl[1])),
+                    rx_op.flat_map(handle_ib_resp("ib_bardata_1hour", conn))
+                )
+        obs = [rx.defer(build_symbols_date_req(symbol)) for symbol in symbols]
+
+        return rx.from_iterable(obs).pipe(
+            rx_op.merge(max_concurrent=5),
+        )
+    return connection.pipe(
+        rx_op.flat_map(handle_conn_status),
+        rx_op.flat_map(run_flow),
+    )
+
 
 def main():
     client = AlphaClientWrapper()
-    connection = client.do_connect(clientId=5)
-    all_symbols = read_symbols_arr() #  ['ABNB'] # read_symbols_arr()[0:5] # rx.create(read_symbols_file) #
+    client.do_connect(clientId=5)
+    # all_symbols = read_symbols_arr() # rx.create(read_symbols_file) #  ['ITE','ABNB', 'AAPL'] #
 
     conn = psycopg2.connect('dbname=alpha user=postgres')
 
@@ -283,34 +336,19 @@ def main():
     def on_complete():
         print('on complete')
 
-    def get_db_bardaily_symbols() -> rx.Observable:
-        symbols = get_all_1daybar_bd_symbols(conn)
-        return rx.just(symbols)
+    # def get_db_bardaily_symbols() -> rx.Observable:
+    #     symbols = get_all_1daybar_bd_symbols(conn)
+    #     return rx.just(symbols)
 
 
 
-    def init_daily_reqs(symbols):
-        def run_flow(_: Any):
-            def build_ibreq(symbol: str):
-                return lambda _: make_ib_contract_req_plain(client, symbol, endDateTime="", durationStr="10 Y", barSizeSetting="1 day")
-            obs_list = [
-                rx.defer(build_ibreq(symbol))
-                for symbol in symbols
-            ]
-            return rx.from_iterable(obs_list).pipe(
-                rx_op.merge(max_concurrent=2),
-                rx_op.flat_map(handle_ib_resp('ib_bardata_1day', conn)),
-            )
-        connection.pipe(
-            rx_op.flat_map(handle_conn_status),
-            rx_op.flat_map(run_flow),
-        ) \
+    # init_daily_reqs(client, conn, all_symbols) \
+    run_1hour_process(client, conn)\
         .subscribe(
             on_next=on_success,
             on_error=on_error,
             on_completed=on_complete,
         )
-    init_daily_reqs(all_symbols)
     client.run()
 
 
