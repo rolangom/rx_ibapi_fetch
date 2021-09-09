@@ -190,10 +190,12 @@ def handle_ib_resp(table_name: str, conn: psycopg2._psycopg.connection):
                 (date, con.symbol, con.exchange, data.open, data.high, data.low, data.close, data.barCount, data.volume, data.average)
             )
             conn.commit()
-            return rx.just((con, date))
+            # return rx.return_value((con, date))
+            return con, date
         except Exception as ex:
             conn.rollback()
-            return rx.throw(ex)
+            raise ex
+            # return rx.throw(ex)
         finally:
             cursor.close()
     return handle_ib_response
@@ -271,17 +273,17 @@ def init_daily_reqs(client: AlphaClientWrapper, conn: psycopg2._psycopg.connecti
     )
 
 def get_all_1daybar_bd_symbols(conn: psycopg2._psycopg.connection) -> List[str]:
-    sql = "SELECT DISTINCT symbol FROM ib_bardata_1day"
+    sql = "SELECT DISTINCT symbol FROM ib_bardata_1day order by 1"
     df = pd.read_sql(sql, conn)
     return df['symbol'].tolist()
 
-def get_symbol_all_days(conn: psycopg2._psycopg.connection, symbol: str) -> Tuple[str, List[dt.date]]:
+def get_symbol_all_days(conn: psycopg2._psycopg.connection, symbol: str) -> List[dt.datetime]: # Tuple[str, List[dt.date]]:
     sql = """SELECT DISTINCT date FROM ib_bardata_1day a
  WHERE symbol = %s
-   and date >= (select max(distinct date_trunc('day',date)) from ib_bardata_1hour x where x.symbol = a.symbol)
+   and date >= coalesce((select max(distinct date_trunc('day',date)) from ib_bardata_1hour x where x.symbol = a.symbol), date '2011-01-01') --  date '2021-07-01' -- 
  order by 1"""
     df = pd.read_sql(sql, conn, params=(symbol,))
-    return symbol, df['date'].tolist()
+    return df['date'].tolist()
 
 def fetch_symbol_1hourbar(client: AlphaClientWrapper) -> Callable[[str, dt.datetime], rx.Observable]:
     def handle_symbol(symbol: str, date: dt.datetime) -> rx.Observable:
@@ -303,18 +305,29 @@ def run_1hour_process(client: AlphaClientWrapper, conn: psycopg2._psycopg.connec
     handle_symbol = fetch_symbol_1hourbar(client)
 
     def run_flow(_: Any):
-        def build_symbols_date_req(symbol: str):
-            return lambda _: rx.of(get_symbol_all_days(conn, symbol))\
-                .pipe(
-                    rx_op.flat_map(lambda tupl: handle_symbol_dates(handle_symbol, tupl[0], tupl[1])),
-                    rx_op.flat_map(handle_ib_resp("ib_bardata_1hour", conn))
-                )
-        obs = [rx.defer(build_symbols_date_req(symbol)) for symbol in symbols]
+        def lazy_handle_symbol_dates(symbol, date):
+            def run(_):
+                return handle_symbol(symbol, date)
+            return run
 
-        return rx.from_iterable(obs).pipe(
-            rx_op.merge(max_concurrent=5),
-        )
-    return connection.pipe(
+        def req_symbol_dates(symbol: str):
+            def run(_):
+                dates = get_symbol_all_days(conn, symbol)
+                obs = [rx.defer(lazy_handle_symbol_dates(symbol, date)) for date in dates]
+                return rx.from_iterable(obs)\
+                    .pipe(
+                        rx_op.merge(max_concurrent=4),
+                        rx_op.map(handle_ib_resp("ib_bardata_1hour", conn)),
+                    )
+            return run
+
+        obs = [rx.defer(req_symbol_dates(symbol)) for symbol in symbols]
+        return rx.from_iterable(obs)\
+            .pipe(
+                rx_op.merge(max_concurrent=2),
+                # rx_op.subscribe_on(thread_pool_scheduler),
+            )
+    return client.do_connect(clientId=1).pipe(
         rx_op.flat_map(handle_conn_status),
         rx_op.flat_map(run_flow),
     )
@@ -322,8 +335,8 @@ def run_1hour_process(client: AlphaClientWrapper, conn: psycopg2._psycopg.connec
 
 def main():
     client = AlphaClientWrapper()
-    client.do_connect(clientId=5)
-    # all_symbols = read_symbols_arr() # rx.create(read_symbols_file) #  ['ITE','ABNB', 'AAPL'] #
+    # client.do_connect(clientId=5)
+    all_symbols = read_symbols_arr() # rx.create(read_symbols_file) #  ['ITE','ABNB', 'AAPL'] #
 
     conn = psycopg2.connect('dbname=alpha user=postgres')
 
